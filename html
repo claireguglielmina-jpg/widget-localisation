@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carte des établissements et transports</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #map { height: 100%; width: 100%; background: #e8e6e0; }
+
+  .panel {
+    background: rgba(255, 255, 255, .96);
+    border-radius: 6px;
+    box-shadow: 0 1px 6px rgba(0, 0, 0, .3);
+    padding: 8px 10px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: #222;
+  }
+  .info { max-width: 260px; }
+  .info .nom { font-weight: 600; font-size: 13.5px; }
+  .info .hint { color: #555; }
+  .info .err { color: #b3261e; }
+
+  .legend { min-width: 190px; }
+  .legend h4 { margin: 0 0 5px; font-size: 12.5px; font-weight: 600; }
+  .legend .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .legend .row .n { margin-left: auto; color: #777; font-variant-numeric: tabular-nums; }
+  .legend hr { border: 0; border-top: 1px solid #ddd; margin: 6px 0; }
+  .dot { width: 13px; height: 13px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.35); flex: none; box-sizing: border-box; }
+  .legend .ico { width: 20px; text-align: center; flex: none; font-size: 14px; }
+
+  /* Icônes des transports */
+  .tp {
+    width: 26px; height: 26px; box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center;
+    background: #fff; border-radius: 50%;
+    font-size: 14px; line-height: 1;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+  }
+  .tp-gare { border: 2px solid #b3261e; }
+  .tp-bus  { border: 2px solid #0b5cad; }
+
+  .leaflet-popup-content { font-size: 13px; }
+  .leaflet-popup-content .sub { color: #555; }
+  .reset-btn { font-size: 16px; line-height: 30px; text-align: center; text-decoration: none; cursor: pointer; width: 30px; height: 30px; display: block; color: #222; background: #fff; }
+  .reset-btn:hover { background: #f4f4f4; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  /* ------------------------------------------------------------------ *
+   *  Configuration
+   * ------------------------------------------------------------------ */
+  const RADIUS_M = 1000; // rayon de zoom et de recherche des transports (en mètres)
+
+  const OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter'
+  ];
+
+  // Catégories d’établissements : libellé de légende + couleur de la puce
+  const CATS = {
+    college: { label: 'Collège (y c. SEGPA)',      color: '#1f6fd6' }, // bleu
+    general: { label: 'Lycée général',             color: '#2e9e44' }, // vert
+    pro:     { label: 'Lycée professionnel',       color: '#f28c1b' }, // orange
+    poly:    { label: 'Lycée polyvalent',          color: '#8e44ad' }, // violet
+    autre:   { label: 'Autre établissement',       color: '#8a8f98' }  // gris
+  };
+
+  /**
+   * Associe la valeur de la colonne « G » à une catégorie.
+   * À adapter ici si besoin.
+   */
+  function classify(g) {
+    const s = String(g || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase();
+    if (/POLYVALENT|\bLPO\b/.test(s)) return 'poly';
+    if (/PROFESSIONNEL|^LP\b/.test(s)) return 'pro';
+    if (/\bLYC/.test(s)) return 'general';
+    if (/COLLEGE|SEGPA/.test(s)) return 'college';
+    return 'autre';
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Utilitaires
+   * ------------------------------------------------------------------ */
+  const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+
+  function toNum(v) {
+    if (typeof v === 'number') return v;
+    if (v == null) return NaN;
+    return parseFloat(String(v).replace(',', '.').trim());
+  }
+
+  function distanceM(lat1, lon1, lat2, lon2) {
+    const R = 6371000, rad = Math.PI / 180;
+    const dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
+    const a = Math.sin(dLat / 2) ** 2 +
+      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Carte
+   * ------------------------------------------------------------------ */
+  const map = L.map('map', { preferCanvas: true }).setView([48.3, 7.5], 8);
+
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">contributeurs OpenStreetMap</a>'
+  }).addTo(map);
+
+  const schoolsLayer = L.layerGroup().addTo(map);
+  const focusLayer = L.layerGroup().addTo(map);
+  const transportLayer = L.layerGroup().addTo(map);
+
+  /* ---- Panneau d’information (haut droite) ---- */
+  const infoEl = L.DomUtil.create('div', 'panel info');
+  const InfoControl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd: function () {
+      L.DomEvent.disableClickPropagation(infoEl);
+      return infoEl;
+    }
+  });
+  map.addControl(new InfoControl());
+
+  function setInfo(html) { infoEl.innerHTML = html; }
+  function setInfoIdle() {
+    setInfo('<span class="hint">Cliquez sur une ligne du tableau pour zoomer à 1&nbsp;km autour de l’établissement.</span>');
+  }
+
+  /* ---- Légende (bas gauche) ---- */
+  const legendEl = L.DomUtil.create('div', 'panel legend');
+  const LegendControl = L.Control.extend({
+    options: { position: 'bottomleft' },
+    onAdd: function () {
+      L.DomEvent.disableClickPropagation(legendEl);
+      return legendEl;
+    }
+  });
+  map.addControl(new LegendControl());
+
+  function renderLegend(counts) {
+    let html = '<h4>Légende</h4>';
+    for (const key of Object.keys(CATS)) {
+      const n = counts ? counts[key] || 0 : 0;
+      if (key === 'autre' && counts && n === 0) continue;
+      html += '<div class="row"><span class="dot" style="background:' + CATS[key].color + '"></span>' +
+        '<span>' + esc(CATS[key].label) + '</span>' +
+        (counts ? '<span class="n">' + n + '</span>' : '') + '</div>';
+    }
+    html += '<hr>' +
+      '<div class="row"><span class="ico">🚆</span><span>Gare</span></div>' +
+      '<div class="row"><span class="ico">🚌</span><span>Arrêt de bus ou de tram</span></div>';
+    legendEl.innerHTML = html;
+  }
+  renderLegend(null);
+
+  /* ---- Bouton « vue d’ensemble » (haut gauche, sous le zoom) ---- */
+  const ResetControl = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd: function () {
+      const bar = L.DomUtil.create('div', 'leaflet-bar');
+      const a = L.DomUtil.create('a', 'reset-btn', bar);
+      a.href = '#';
+      a.title = 'Vue d’ensemble';
+      a.setAttribute('role', 'button');
+      a.setAttribute('aria-label', 'Vue d’ensemble');
+      a.innerHTML = '⤢';
+      L.DomEvent.disableClickPropagation(bar);
+      L.DomEvent.on(a, 'click', function (e) {
+        L.DomEvent.preventDefault(e);
+        resetView();
+      });
+      return bar;
+    }
+  });
+  map.addControl(new ResetControl());
+
+  /* ------------------------------------------------------------------ *
+   *  Établissements
+   * ------------------------------------------------------------------ */
+  let schoolPoints = [];   // [lat, lng] pour la vue d’ensemble
+  let current = null;      // établissement sélectionné
+  let hasFitAll = false;
+
+  function renderSchools(rows) {
+    schoolsLayer.clearLayers();
+    schoolPoints = [];
+    const seen = new Set();
+    const counts = { college: 0, general: 0, pro: 0, poly: 0, autre: 0 };
+
+    for (const r of rows) {
+      const key = [r.type, r.nom, r.lat.toFixed(6), r.lng.toFixed(6)].join('|');
+      if (seen.has(key)) continue; // le même établissement peut apparaître sur plusieurs lignes
+      seen.add(key);
+
+      const cat = classify(r.type);
+      counts[cat]++;
+      schoolPoints.push([r.lat, r.lng]);
+
+      const m = L.circleMarker([r.lat, r.lng], {
+        radius: 7,
+        color: '#ffffff',
+        weight: 1.5,
+        fillColor: CATS[cat].color,
+        fillOpacity: 0.95
+      });
+      m.bindTooltip(esc(r.nom || 'Sans nom'), { direction: 'top', offset: [0, -6] });
+      m.bindPopup(
+        '<b>' + esc(r.nom || 'Sans nom') + '</b><br>' +
+        '<span class="sub">' + esc(r.type || '') + '</span>'
+      );
+      m.on('click', function () {
+        try { grist.setCursorPos({ rowId: r.id }); } catch (e) { /* ignoré */ }
+      });
+      m.addTo(schoolsLayer);
+    }
+
+    renderLegend(counts);
+
+    if (!hasFitAll && !current && schoolPoints.length) {
+      map.fitBounds(L.latLngBounds(schoolPoints), { padding: [30, 30] });
+      hasFitAll = true;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Sélection d’une ligne : zoom à 1 km + transports OSM
+   * ------------------------------------------------------------------ */
+  function focusOn(s) {
+    current = s;
+    focusLayer.clearLayers();
+    transportLayer.clearLayers();
+
+    const center = [s.lat, s.lng];
+    const circle = L.circle(center, {
+      radius: RADIUS_M, color: '#222', weight: 2, dashArray: '6 6',
+      fillColor: '#4a90e2', fillOpacity: 0.05, interactive: false
+    }).addTo(focusLayer);
+    L.circleMarker(center, {
+      radius: 12, color: '#111', weight: 3, fill: false, interactive: false
+    }).addTo(focusLayer);
+
+    map.fitBounds(circle.getBounds(), { padding: [6, 6] });
+
+    const cat = classify(s.type);
+    setInfo(
+      '<div class="nom">' + esc(s.nom || 'Sans nom') + '</div>' +
+      '<div class="hint">' + esc(CATS[cat].label) + '</div>' +
+      '<div class="hint">Recherche des transports…</div>'
+    );
+    scheduleTransport(s);
+  }
+
+  function resetView() {
+    reqId++;
+    if (abortCtrl) abortCtrl.abort();
+    clearTimeout(timer);
+    current = null;
+    focusLayer.clearLayers();
+    transportLayer.clearLayers();
+    setInfoIdle();
+    if (schoolPoints.length) map.fitBounds(L.latLngBounds(schoolPoints), { padding: [30, 30] });
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Transports via Overpass (OpenStreetMap)
+   * ------------------------------------------------------------------ */
+  let reqId = 0, abortCtrl = null, timer = null;
+  const cache = new Map();
+
+  function scheduleTransport(s) {
+    clearTimeout(timer);
+    timer = setTimeout(() => loadTransport(s), 300); // évite les requêtes en rafale quand on parcourt les lignes
+  }
+
+  async function loadTransport(s) {
+    const id = ++reqId;
+    if (abortCtrl) abortCtrl.abort();
+    const key = s.lat.toFixed(5) + ',' + s.lng.toFixed(5);
+
+    try {
+      let elements = cache.get(key);
+      if (!elements) {
+        abortCtrl = new AbortController();
+        elements = await queryOverpass(s.lat, s.lng, abortCtrl.signal);
+        cache.set(key, elements);
+      }
+      if (id !== reqId) return;
+      drawTransport(elements, s);
+    } catch (e) {
+      if (id !== reqId || (e && e.name === 'AbortError')) return;
+      const cat = classify(s.type);
+      setInfo(
+        '<div class="nom">' + esc(s.nom || 'Sans nom') + '</div>' +
+        '<div class="hint">' + esc(CATS[cat].label) + '</div>' +
+        '<div class="err">Impossible de charger les gares et arrêts depuis OpenStreetMap. Cliquez à nouveau sur la ligne pour réessayer.</div>'
+      );
+    }
+  }
+
+  async function queryOverpass(lat, lng, signal) {
+    const around = '(around:' + RADIUS_M + ',' + lat + ',' + lng + ')';
+    const q = '[out:json][timeout:25];(' +
+      'nwr["railway"~"^(station|halt)$"]' + around + ';' +
+      'node["railway"="tram_stop"]' + around + ';' +
+      'node["highway"="bus_stop"]' + around + ';' +
+      ');out center tags;';
+
+    let lastErr = new Error('Overpass indisponible');
+    for (const url of OVERPASS_ENDPOINTS) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'data=' + encodeURIComponent(q),
+          signal: signal
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+        return json.elements || [];
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        lastErr = e;
+      }
+    }
+    throw lastErr;
+  }
+
+  function transportIcon(kind) {
+    return L.divIcon({
+      className: '',
+      html: '<div class="tp tp-' + kind + '">' + (kind === 'gare' ? '🚆' : '🚌') + '</div>',
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+      popupAnchor: [0, -13],
+      tooltipAnchor: [0, -13]
+    });
+  }
+
+  function drawTransport(elements, s) {
+    transportLayer.clearLayers();
+
+    const items = [];
+    for (const el of elements) {
+      const t = el.tags || {};
+      const lat = el.lat != null ? el.lat : (el.center && el.center.lat);
+      const lon = el.lon != null ? el.lon : (el.center && el.center.lon);
+      if (lat == null || lon == null) continue;
+
+      let kind, label;
+      if (t.railway === 'station' || t.railway === 'halt') { kind = 'gare'; label = 'Gare'; }
+      else if (t.railway === 'tram_stop') { kind = 'bus'; label = 'Arrêt de tram'; }
+      else if (t.highway === 'bus_stop') { kind = 'bus'; label = 'Arrêt de bus'; }
+      else continue;
+
+      items.push({ kind: kind, label: label, lat: lat, lon: lon, name: t.name || t['name:fr'] || '' });
+    }
+
+    // Une gare peut être cartographiée à la fois en point et en bâtiment : on évite les doublons
+    const gares = [];
+    const kept = items.filter((it) => {
+      if (it.kind !== 'gare' || !it.name) return true;
+      const dup = gares.some((g) => g.name.toLowerCase() === it.name.toLowerCase() &&
+        distanceM(g.lat, g.lon, it.lat, it.lon) < 250);
+      if (!dup) gares.push(it);
+      return !dup;
+    });
+
+    let nGares = 0, nArrets = 0;
+    for (const it of kept) {
+      if (it.kind === 'gare') nGares++; else nArrets++;
+      const d = Math.round(distanceM(s.lat, s.lng, it.lat, it.lon) / 10) * 10;
+      const title = it.name || (it.kind === 'gare' ? 'Gare sans nom' : 'Arrêt sans nom');
+      const marker = L.marker([it.lat, it.lon], {
+        icon: transportIcon(it.kind),
+        zIndexOffset: it.kind === 'gare' ? 500 : 0
+      });
+      marker.bindTooltip(esc(title), { direction: 'top' });
+      marker.bindPopup(
+        '<b>' + esc(title) + '</b><br>' +
+        '<span class="sub">' + esc(it.label) + ' · à ' + d + '&nbsp;m de l’établissement</span>'
+      );
+      marker.addTo(transportLayer);
+    }
+
+    const cat = classify(s.type);
+    const plural = (n, one, many) => n + '&nbsp;' + (n > 1 ? many : one);
+    setInfo(
+      '<div class="nom">' + esc(s.nom || 'Sans nom') + '</div>' +
+      '<div class="hint">' + esc(CATS[cat].label) + '</div>' +
+      '<div>🚆 ' + plural(nGares, 'gare', 'gares') + ' · 🚌 ' + plural(nArrets, 'arrêt', 'arrêts') +
+      ' <span class="hint">dans ' + (RADIUS_M / 1000) + '&nbsp;km</span></div>'
+    );
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Connexion à Grist
+   * ------------------------------------------------------------------ */
+  function mapRow(rec) {
+    const m = grist.mapColumnNames(rec);
+    if (!m) return null;
+    const lat = toNum(m.lat), lng = toNum(m.lng);
+    if (!isFinite(lat) || !isFinite(lng)) return { invalid: true };
+    return { id: rec.id, type: m.type, nom: m.nom, lat: lat, lng: lng };
+  }
+
+  if (typeof grist === 'undefined') {
+    setInfo('<span class="err">Ce widget doit être ouvert depuis Grist (widget personnalisé).</span>');
+    return;
+  }
+
+  setInfoIdle();
+
+  grist.ready({
+    requiredAccess: 'read table',
+    columns: [
+      { name: 'type', title: 'Type d’établissement (colonne G)', type: 'Text,Choice' },
+      { name: 'nom',  title: 'Nom', type: 'Text,Choice', optional: true },
+      { name: 'lat',  title: 'Latitude', type: 'Numeric,Text' },
+      { name: 'lng',  title: 'Longitude', type: 'Numeric,Text' }
+    ]
+  });
+
+  grist.onRecords(function (records) {
+    if (!records) return;
+    const rows = [];
+    for (const rec of records) {
+      const r = mapRow(rec);
+      if (r && !r.invalid) rows.push(r);
+    }
+    renderSchools(rows);
+  });
+
+  grist.onRecord(function (rec) {
+    if (!rec) return;
+    const r = mapRow(rec);
+    if (!r) {
+      setInfo('<span class="err">Associez les colonnes dans le panneau de configuration du widget.</span>');
+      return;
+    }
+    if (r.invalid) {
+      setInfo('<span class="err">Cette ligne n’a pas de coordonnées valides.</span>');
+      return;
+    }
+    focusOn(r);
+  });
+})();
+</script>
+</body>
+</html>
